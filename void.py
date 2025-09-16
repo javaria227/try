@@ -76,14 +76,14 @@ class FaceApp:
         lip_mask = np.zeros(image.shape[:2], dtype=np.uint8)
         cv2.fillPoly(lip_mask, [outer_lip.astype(np.int32)], 255)
 
-        # --- Estimate skin tone around lips ---
+        # --- Estimate skin tone around original lips (initial guess) ---
         dilated = cv2.dilate(lip_mask, np.ones((25, 25), np.uint8), iterations=1)
-        skin_ring = cv2.subtract(dilated, lip_mask)   # ring just outside lips
+        skin_ring = cv2.subtract(dilated, lip_mask)
         skin_pixels = image[skin_ring == 255]
         if len(skin_pixels) > 0:
             skin_color = np.median(skin_pixels, axis=0).astype(np.uint8)
         else:
-            skin_color = (180, 130, 100)  # fallback beige tone
+            skin_color = (180, 130, 100)
 
         # Lip texture
         lip_texture = cv2.bitwise_and(image, image, mask=lip_mask)
@@ -92,6 +92,8 @@ class FaceApp:
         src_pts = outer_lip.astype(np.float32)
         dst_pts = new_outer.astype(np.float32)
         M, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        if M is None:
+            return image
         warped = cv2.warpPerspective(lip_texture, M, (image.shape[1], image.shape[0]))
 
         # New expanded lip mask
@@ -106,20 +108,29 @@ class FaceApp:
         void_mask = (gray_warped < 10).astype(np.uint8) * 255  # Very dark areas
         void_mask = cv2.bitwise_and(void_mask, new_mask)  # Only within lip area
 
-        # Fill voids with skin color using inpainting
+        # Fill voids with skin color
         if np.sum(void_mask) > 0:
-            # Create a version with skin color in void areas
             skin_filler = np.full_like(image, skin_color, dtype=np.uint8)
             new_lips = np.where(void_mask[..., np.newaxis] > 0, skin_filler, new_lips)
+        # --- Minimal seam fix: replace dark edge pixels with background and alpha blend ---
+        # Identify a thin inside boundary ring where warping can create dark pixels
+        edge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        edge = cv2.morphologyEx(new_mask, cv2.MORPH_GRADIENT, edge_kernel)
+        seam_inside = cv2.bitwise_and(edge, new_mask)
 
-        combined_lips = new_lips
+        gray_lips = cv2.cvtColor(new_lips, cv2.COLOR_BGR2GRAY)
+        dark_edge = (gray_lips < 15).astype(np.uint8) * 255
+        dark_seam = cv2.bitwise_and(seam_inside, dark_edge)
 
-        # Feather mask for smooth edges
-        blurred_mask = cv2.GaussianBlur(new_mask, (15, 15), 10)
+        if np.any(dark_seam):
+            mask3 = dark_seam.astype(bool)
+            new_lips[mask3] = image[mask3]
 
-        # Paste back
-        background = cv2.bitwise_and(image, image, mask=cv2.bitwise_not(new_mask))
-        result = cv2.add(background, cv2.bitwise_and(combined_lips, combined_lips, mask=blurred_mask))
+        # Proper alpha blending using a softened mask
+        alpha = cv2.GaussianBlur(new_mask, (15, 15), 5.0).astype(np.float32) / 255.0
+        alpha_3 = alpha[..., np.newaxis]
+        result = alpha_3 * new_lips.astype(np.float32) + (1.0 - alpha_3) * image.astype(np.float32)
+        result = np.clip(result, 0, 255).astype(np.uint8)
 
         return result
        
