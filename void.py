@@ -112,49 +112,39 @@ class FaceApp:
         if np.sum(void_mask) > 0:
             skin_filler = np.full_like(image, skin_color, dtype=np.uint8)
             new_lips = np.where(void_mask[..., np.newaxis] > 0, skin_filler, new_lips)
-        # --- Re-estimate skin tone around the NEW lip mask to match new boundary ---
-        kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
-        new_dilated = cv2.dilate(new_mask, kernel_large, iterations=1)
-        new_skin_ring = cv2.subtract(new_dilated, new_mask)
-        new_skin_pixels = image[new_skin_ring == 255]
-        if len(new_skin_pixels) > 0:
-            skin_color = np.median(new_skin_pixels, axis=0).astype(np.uint8)
+        # --- Seamless (Poisson) blending to avoid any visible polygon/outline ---
+        # Slightly erode the mask so blending happens inside the boundary
+        mask_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        blend_mask = cv2.erode(new_mask, mask_kernel, iterations=1)
 
-        # --- Build a thin seam ring on the boundary and recolor to skin ---
-        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        edge = cv2.morphologyEx(new_mask, cv2.MORPH_GRADIENT, kernel_small)
-        edge = cv2.dilate(edge, kernel_small, iterations=1)  # widen slightly
-        seam_inside = cv2.bitwise_and(edge, new_mask)
-        seam_outside = cv2.bitwise_and(edge, cv2.bitwise_not(new_mask))
+        # Compute clone center from mask moments
+        m = cv2.moments(blend_mask)
+        if m["m00"] == 0:
+            return image
+        cx = int(m["m10"] / m["m00"])
+        cy = int(m["m01"] / m["m00"]) 
 
-        skin_layer = np.full_like(image, skin_color, dtype=np.uint8)
+        # Source object is the warped lips on black background
+        src = new_lips
 
-        # Soft masks for blending seams
-        seam_inside_soft = cv2.GaussianBlur(seam_inside, (0, 0), 1.0)
-        seam_outside_soft = cv2.GaussianBlur(seam_outside, (0, 0), 1.0)
+        def soft_blend_fallback(src_img, dst_img, mask_img):
+            alpha = cv2.GaussianBlur(mask_img, (0, 0), 3.0).astype(np.float32) / 255.0
+            alpha_3 = alpha[..., np.newaxis]
+            out = alpha_3 * src_img.astype(np.float32) + (1.0 - alpha_3) * dst_img.astype(np.float32)
+            return np.clip(out, 0, 255).astype(np.uint8)
 
-        # Apply skin color to inside seam on warped lips
-        if np.any(seam_inside_soft > 0):
-            s_in = (seam_inside_soft.astype(np.float32) / 255.0)[..., np.newaxis]
-            new_lips = (1.0 - s_in) * new_lips.astype(np.float32) + s_in * skin_layer.astype(np.float32)
-            new_lips = np.clip(new_lips, 0, 255).astype(np.uint8)
+        if not hasattr(cv2, 'seamlessClone'):
+            return soft_blend_fallback(src, image, blend_mask)
 
-        # Prepare base image and apply skin color to outside seam on background
-        base = image.copy()
-        if np.any(seam_outside_soft > 0):
-            s_out = (seam_outside_soft.astype(np.float32) / 255.0)[..., np.newaxis]
-            base = (1.0 - s_out) * base.astype(np.float32) + s_out * skin_layer.astype(np.float32)
-            base = np.clip(base, 0, 255).astype(np.uint8)
-
-        # Feather the whole lip mask for smooth alpha blending
-        alpha = cv2.GaussianBlur(new_mask, (0, 0), 3.0).astype(np.float32) / 255.0
-        alpha_3 = alpha[..., np.newaxis]
-
-        # True alpha blend instead of bitwise add to avoid seams
-        result = alpha_3 * new_lips.astype(np.float32) + (1.0 - alpha_3) * base.astype(np.float32)
-        result = np.clip(result, 0, 255).astype(np.uint8)
-
-        return result
+        try:
+            result = cv2.seamlessClone(src, image, blend_mask, (cx, cy), cv2.MIXED_CLONE)
+            return result
+        except Exception:
+            try:
+                result = cv2.seamlessClone(src, image, blend_mask, (cx, cy), cv2.NORMAL_CLONE)
+                return result
+            except Exception:
+                return soft_blend_fallback(src, image, blend_mask)
        
     def update_display(self):
         if self.original_image is None or self.processing:
