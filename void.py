@@ -112,39 +112,27 @@ class FaceApp:
         if np.sum(void_mask) > 0:
             skin_filler = np.full_like(image, skin_color, dtype=np.uint8)
             new_lips = np.where(void_mask[..., np.newaxis] > 0, skin_filler, new_lips)
-        # --- Seamless (Poisson) blending to avoid any visible polygon/outline ---
-        # Slightly erode the mask so blending happens inside the boundary
-        mask_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        blend_mask = cv2.erode(new_mask, mask_kernel, iterations=1)
+        # --- Minimal seam fix: replace dark edge pixels with background and alpha blend ---
+        # Identify a thin inside boundary ring where warping can create dark pixels
+        edge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        edge = cv2.morphologyEx(new_mask, cv2.MORPH_GRADIENT, edge_kernel)
+        seam_inside = cv2.bitwise_and(edge, new_mask)
 
-        # Compute clone center from mask moments
-        m = cv2.moments(blend_mask)
-        if m["m00"] == 0:
-            return image
-        cx = int(m["m10"] / m["m00"])
-        cy = int(m["m01"] / m["m00"]) 
+        gray_lips = cv2.cvtColor(new_lips, cv2.COLOR_BGR2GRAY)
+        dark_edge = (gray_lips < 15).astype(np.uint8) * 255
+        dark_seam = cv2.bitwise_and(seam_inside, dark_edge)
 
-        # Source object is the warped lips on black background
-        src = new_lips
+        if np.any(dark_seam):
+            mask3 = dark_seam.astype(bool)
+            new_lips[mask3] = image[mask3]
 
-        def soft_blend_fallback(src_img, dst_img, mask_img):
-            alpha = cv2.GaussianBlur(mask_img, (0, 0), 3.0).astype(np.float32) / 255.0
-            alpha_3 = alpha[..., np.newaxis]
-            out = alpha_3 * src_img.astype(np.float32) + (1.0 - alpha_3) * dst_img.astype(np.float32)
-            return np.clip(out, 0, 255).astype(np.uint8)
+        # Proper alpha blending using a softened mask
+        alpha = cv2.GaussianBlur(new_mask, (15, 15), 5.0).astype(np.float32) / 255.0
+        alpha_3 = alpha[..., np.newaxis]
+        result = alpha_3 * new_lips.astype(np.float32) + (1.0 - alpha_3) * image.astype(np.float32)
+        result = np.clip(result, 0, 255).astype(np.uint8)
 
-        if not hasattr(cv2, 'seamlessClone'):
-            return soft_blend_fallback(src, image, blend_mask)
-
-        try:
-            result = cv2.seamlessClone(src, image, blend_mask, (cx, cy), cv2.MIXED_CLONE)
-            return result
-        except Exception:
-            try:
-                result = cv2.seamlessClone(src, image, blend_mask, (cx, cy), cv2.NORMAL_CLONE)
-                return result
-            except Exception:
-                return soft_blend_fallback(src, image, blend_mask)
+        return result
        
     def update_display(self):
         if self.original_image is None or self.processing:
