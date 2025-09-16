@@ -76,14 +76,14 @@ class FaceApp:
         lip_mask = np.zeros(image.shape[:2], dtype=np.uint8)
         cv2.fillPoly(lip_mask, [outer_lip.astype(np.int32)], 255)
 
-        # --- Estimate skin tone around lips ---
+        # --- Estimate skin tone around original lips (initial guess) ---
         dilated = cv2.dilate(lip_mask, np.ones((25, 25), np.uint8), iterations=1)
-        skin_ring = cv2.subtract(dilated, lip_mask)   # ring just outside lips
+        skin_ring = cv2.subtract(dilated, lip_mask)
         skin_pixels = image[skin_ring == 255]
         if len(skin_pixels) > 0:
             skin_color = np.median(skin_pixels, axis=0).astype(np.uint8)
         else:
-            skin_color = (180, 130, 100)  # fallback beige tone
+            skin_color = (180, 130, 100)
 
         # Lip texture
         lip_texture = cv2.bitwise_and(image, image, mask=lip_mask)
@@ -92,6 +92,8 @@ class FaceApp:
         src_pts = outer_lip.astype(np.float32)
         dst_pts = new_outer.astype(np.float32)
         M, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        if M is None:
+            return image
         warped = cv2.warpPerspective(lip_texture, M, (image.shape[1], image.shape[0]))
 
         # New expanded lip mask
@@ -106,20 +108,51 @@ class FaceApp:
         void_mask = (gray_warped < 10).astype(np.uint8) * 255  # Very dark areas
         void_mask = cv2.bitwise_and(void_mask, new_mask)  # Only within lip area
 
-        # Fill voids with skin color using inpainting
+        # Fill voids with skin color
         if np.sum(void_mask) > 0:
-            # Create a version with skin color in void areas
             skin_filler = np.full_like(image, skin_color, dtype=np.uint8)
             new_lips = np.where(void_mask[..., np.newaxis] > 0, skin_filler, new_lips)
+        # --- Re-estimate skin tone around the NEW lip mask to match new boundary ---
+        kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+        new_dilated = cv2.dilate(new_mask, kernel_large, iterations=1)
+        new_skin_ring = cv2.subtract(new_dilated, new_mask)
+        new_skin_pixels = image[new_skin_ring == 255]
+        if len(new_skin_pixels) > 0:
+            skin_color = np.median(new_skin_pixels, axis=0).astype(np.uint8)
 
-        combined_lips = new_lips
+        # --- Build a thin seam ring on the boundary and recolor to skin ---
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        edge = cv2.morphologyEx(new_mask, cv2.MORPH_GRADIENT, kernel_small)
+        edge = cv2.dilate(edge, kernel_small, iterations=1)  # widen slightly
+        seam_inside = cv2.bitwise_and(edge, new_mask)
+        seam_outside = cv2.bitwise_and(edge, cv2.bitwise_not(new_mask))
 
-        # Feather mask for smooth edges
-        blurred_mask = cv2.GaussianBlur(new_mask, (15, 15), 10)
+        skin_layer = np.full_like(image, skin_color, dtype=np.uint8)
 
-        # Paste back
-        background = cv2.bitwise_and(image, image, mask=cv2.bitwise_not(new_mask))
-        result = cv2.add(background, cv2.bitwise_and(combined_lips, combined_lips, mask=blurred_mask))
+        # Soft masks for blending seams
+        seam_inside_soft = cv2.GaussianBlur(seam_inside, (0, 0), 1.0)
+        seam_outside_soft = cv2.GaussianBlur(seam_outside, (0, 0), 1.0)
+
+        # Apply skin color to inside seam on warped lips
+        if np.any(seam_inside_soft > 0):
+            s_in = (seam_inside_soft.astype(np.float32) / 255.0)[..., np.newaxis]
+            new_lips = (1.0 - s_in) * new_lips.astype(np.float32) + s_in * skin_layer.astype(np.float32)
+            new_lips = np.clip(new_lips, 0, 255).astype(np.uint8)
+
+        # Prepare base image and apply skin color to outside seam on background
+        base = image.copy()
+        if np.any(seam_outside_soft > 0):
+            s_out = (seam_outside_soft.astype(np.float32) / 255.0)[..., np.newaxis]
+            base = (1.0 - s_out) * base.astype(np.float32) + s_out * skin_layer.astype(np.float32)
+            base = np.clip(base, 0, 255).astype(np.uint8)
+
+        # Feather the whole lip mask for smooth alpha blending
+        alpha = cv2.GaussianBlur(new_mask, (0, 0), 3.0).astype(np.float32) / 255.0
+        alpha_3 = alpha[..., np.newaxis]
+
+        # True alpha blend instead of bitwise add to avoid seams
+        result = alpha_3 * new_lips.astype(np.float32) + (1.0 - alpha_3) * base.astype(np.float32)
+        result = np.clip(result, 0, 255).astype(np.uint8)
 
         return result
        
